@@ -1,10 +1,11 @@
+import concurrent.futures
 import requests
 import time
 from urllib.parse import urlparse, parse_qs, urlencode
 from termcolor import colored
 
-# Rate-limiting configuration
-RATE_LIMIT = 0.5  # Delay between requests (in seconds)
+# Rate-limiting configuration (adjusted for higher speed)
+RATE_LIMIT = 0.1  # Delay between requests (in seconds)
 
 # Load payloads
 def load_payloads():
@@ -23,7 +24,7 @@ def detect_methods(url):
     except Exception as e:
         print(f"[!] Error detecting methods: {e}")
     # Default methods if OPTIONS fails
-    return ["GET", "POST", "PUT", "DELETE", "PATCH"]
+    return ["GET", "POST"]
 
 def test_payloads(url, methods, parameters):
     """Inject payloads into each parameter and test with all methods."""
@@ -88,8 +89,10 @@ def main():
         urls.append(target)
 
     print(f"[+] Loaded {len(urls)} URL(s) for testing.")
-    for url in urls:
-        scan_url(url)
+
+    # Use ThreadPoolExecutor to run scans in parallel (increased workers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+        executor.map(scan_url, urls)
 
 if __name__ == "__main__":
     main()
