@@ -4,8 +4,8 @@ import time
 from urllib.parse import urlparse, parse_qs, urlencode
 from termcolor import colored
 
-# Rate-limiting configuration (adjusted for higher speed)
-RATE_LIMIT = 0.1  # Delay between requests (in seconds)
+# Rate-limiting configuration (further reduced speed)
+RATE_LIMIT = 2.0  # Delay between requests (in seconds)
 
 # Load payloads
 def load_payloads():
@@ -55,8 +55,10 @@ def send_request(method, url, payload, param):
                 waf_log.write(f"Blocked | {method} | {url} | {payload}\n")
         elif payload in response.text:
             print(colored(f"[+] XSS Found: {url} | Parameter: {param} | Payload: {payload}", "red"))
+            # Write the result in the required format
+            vulnerable_url = url.replace(payload, f"<script>{payload}</script>")
             with open("xss_results.txt", "a") as result_file:
-                result_file.write(f"XSS | {method} | {url} | {param} | {payload}\n")
+                result_file.write(f"{vulnerable_url}\n")
         else:
             print(colored(f"[-] No XSS: {url} with payload {payload}", "green"))
 
@@ -90,8 +92,8 @@ def main():
 
     print(f"[+] Loaded {len(urls)} URL(s) for testing.")
 
-    # Use ThreadPoolExecutor to run scans in parallel (increased workers)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+    # Use ThreadPoolExecutor to run scans in parallel (further reduced workers)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         executor.map(scan_url, urls)
 
 if __name__ == "__main__":
