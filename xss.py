@@ -1,100 +1,171 @@
-import concurrent.futures
+import os
+import random
+import string
+import base64
 import requests
+import asyncio
+import aiohttp
+from urllib.parse import urljoin
+from flask import Flask, request, jsonify
 import time
-from urllib.parse import urlparse, parse_qs, urlencode
-from termcolor import colored
+import logging
+from packaging import version
+from urllib3.util.retry import Retry
+from requests.adapters import HTTPAdapter
+from requests.exceptions import RequestException
+import subprocess
+import json
+from datetime import datetime
 
-# Rate-limiting configuration (further reduced speed)
-RATE_LIMIT = 2.0  # Delay between requests (in seconds)
+# Flask setup
+app = Flask(__name__)
 
-# Load payloads
-def load_payloads():
-    payload_file = input("Enter the payload file path: ").strip()
-    with open(payload_file, "r") as file:
-        return [line.strip() for line in file if line.strip()]
+# Set up logging for security and reliability
+logging.basicConfig(filename="scan_log.txt", level=logging.INFO, format="%(asctime)s - %(message)s")
 
-PAYLOADS = load_payloads()
+# Secure communication (HTTPS)
+SECURE_PROTOCOL = 'https'
 
-def detect_methods(url):
-    """Detect allowed HTTP methods using an OPTIONS request."""
+# Rate limiting
+MAX_REQUESTS_PER_SECOND = 2  # Adjustable rate
+last_request_time = time.time()
+
+# Retry logic for requests with exponential backoff
+retry_strategy = Retry(
+    total=3,
+    backoff_factor=1,
+    status_forcelist=[500, 502, 503, 504],
+    allowed_methods=["HEAD", "GET", "POST"]
+)
+http_adapter = HTTPAdapter(max_retries=retry_strategy)
+http_session = requests.Session()
+http_session.mount("https://", http_adapter)
+http_session.mount("http://", http_adapter)
+
+# Version management
+GITHUB_REPO_URL = "https://api.github.com/repos/yourusername/yourrepo/releases/latest"
+LOCAL_VERSION_FILE = "version.json"  # Store the local version info
+
+def get_local_version():
+    """Get the local version of the tool from version.json."""
+    if os.path.exists(LOCAL_VERSION_FILE):
+        with open(LOCAL_VERSION_FILE, 'r') as f:
+            version_info = json.load(f)
+            return version_info.get("version", "0.0.0")
+    return "0.0.0"
+
+def save_local_version(version):
+    """Save the local version to version.json."""
+    version_info = {"version": version}
+    with open(LOCAL_VERSION_FILE, 'w') as f:
+        json.dump(version_info, f)
+
+def check_for_updates():
+    """Check for updates by comparing the local version with the latest release on GitHub."""
+    local_version = get_local_version()
     try:
-        response = requests.options(url, timeout=10)
-        if response.status_code == 200 and "Allow" in response.headers:
-            return response.headers["Allow"].split(", ")
-    except Exception as e:
-        print(f"[!] Error detecting methods: {e}")
-    # Default methods if OPTIONS fails
-    return ["GET", "POST"]
+        response = requests.get(GITHUB_REPO_URL)
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        latest_release = response.json()
+        print(f"GitHub API Response: {latest_release}")  # Print the full response for debugging
 
-def test_payloads(url, methods, parameters):
-    """Inject payloads into each parameter and test with all methods."""
-    for method in methods:
-        for param in parameters:
-            for payload in PAYLOADS:
-                # Inject payload into the current parameter
-                modified_params = parameters.copy()
-                modified_params[param] = payload
-                query_string = urlencode(modified_params)
-
-                # Construct the test URL
-                test_url = f"{url.scheme}://{url.netloc}{url.path}?{query_string}"
-
-                print(f"Testing with payload: {payload} on {test_url} using {method}")
-                send_request(method, test_url, payload, param)
-
-                time.sleep(RATE_LIMIT)
-
-def send_request(method, url, payload, param):
-    """Send an HTTP request and check for XSS vulnerabilities."""
-    try:
-        response = requests.request(method, url, timeout=10)
-
-        if response.status_code in [403, 406]:
-            print(colored(f"[!] WAF Blocked: {url} with payload {payload}", "yellow"))
-            with open("waf_logs.txt", "a") as waf_log:
-                waf_log.write(f"Blocked | {method} | {url} | {payload}\n")
-        elif payload in response.text:
-            print(colored(f"[+] XSS Found: {url} | Parameter: {param} | Payload: {payload}", "red"))
-            # Write the result in the required format
-            vulnerable_url = url.replace(payload, f"<script>{payload}</script>")
-            with open("xss_results.txt", "a") as result_file:
-                result_file.write(f"{vulnerable_url}\n")
+        # Check if 'tag_name' exists in the response
+        if 'tag_name' in latest_release:
+            latest_version = latest_release['tag_name']
+            print(f"Latest Version: {latest_version}, Local Version: {local_version}")
+            if version.parse(latest_version) > version.parse(local_version):
+                print(f"\033[1;32m[UPDATE AVAILABLE]\033[0m A new version ({latest_version}) is available!")
+                return latest_version
+            else:
+                print("\033[1;34m[UP TO DATE]\033[0m You are running the latest version.")
+                return None
         else:
-            print(colored(f"[-] No XSS: {url} with payload {payload}", "green"))
+            print(f"\033[1;31m[ERROR]\033[0m 'tag_name' not found in the response.")
+            return None
+    except requests.RequestException as e:
+        print(f"\033[1;31m[ERROR]\033[0m Failed to check for updates: {e}")
+        return None
 
-    except Exception as e:
-        print(colored(f"[!] Error testing {url}: {e}", "yellow"))
+def update_tool():
+    """Update the tool to the latest version by pulling from the GitHub repository."""
+    print("Updating tool to the latest version...")
+    try:
+        subprocess.run(["git", "pull"], check=True)
+        print("\033[1;32m[UPDATE SUCCESSFUL]\033[0m Tool has been updated.")
+        latest_version = check_for_updates()
+        if latest_version:
+            save_local_version(latest_version)
+    except subprocess.CalledProcessError as e:
+        print(f"\033[1;31m[ERROR]\033[0m Failed to update tool: {e}")
 
-def scan_url(target_url):
-    """Scan a single URL for XSS vulnerabilities."""
-    # Parse the URL and detect parameters
-    parsed_url = urlparse(target_url)
-    parameters = parse_qs(parsed_url.query)
-    parameters = {k: v[0] if v else "" for k, v in parameters.items()}
+# WAF Bypass Techniques
+def generate_random_string(length=10):
+    """Generate a random string of specified length."""
+    return ''.join(random.choices(string.ascii_letters + string.digits, k=length))
 
-    # Detect allowed methods
-    methods = detect_methods(target_url)
-    print(f"[+] Detected methods for {target_url}: {', '.join(methods)}")
+def encode_payload(payload):
+    """Apply encoding techniques to payloads to bypass WAFs."""
+    encoded_payloads = []
+    url_encoded = payload.replace('<', '%3C').replace('>', '%3E').replace('"', '%22').replace("'", '%27')
+    encoded_payloads.append(url_encoded)
+    
+    double_url_encoded = base64.b64encode(url_encoded.encode()).decode('utf-8')
+    encoded_payloads.append(double_url_encoded)
+    
+    base64_encoded = base64.b64encode(payload.encode()).decode('utf-8')
+    encoded_payloads.append(base64_encoded)
+    
+    return encoded_payloads
 
-    # Test payloads with detected methods
-    test_payloads(parsed_url, methods, parameters)
+def randomize_headers(headers):
+    """Add random headers to requests to bypass WAFs."""
+    headers['X-Forwarded-For'] = generate_random_string(12)
+    headers['X-Requested-With'] = generate_random_string(8)
+    headers['User-Agent'] = random.choice([
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/94.0.4606.61 Safari/537.36',
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Edge/18.18363'
+    ])
+    return headers
 
-def main():
-    """Main function to run the script."""
-    target = input("Enter the target URL or file path: ").strip()
-    urls = []
+def rate_limit_request():
+    """Enforce rate limiting to ensure requests are not sent too quickly."""
+    global last_request_time
+    current_time = time.time()
+    elapsed_time = current_time - last_request_time
+    if elapsed_time < 1 / MAX_REQUESTS_PER_SECOND:
+        time.sleep(1 / MAX_REQUESTS_PER_SECOND - elapsed_time)
+    last_request_time = time.time()
 
-    if target.endswith(".txt"):
-        with open(target, "r") as file:
-            urls = [line.strip() for line in file if line.strip()]
-    else:
-        urls.append(target)
+async def async_submit_payload(session, url, payload, method, cookies, headers, max_retries=3):
+    """Asynchronously submit a payload and attempt to bypass WAFs."""
+    headers = randomize_headers(headers)
+    encoded_payloads = encode_payload(payload)
 
-    print(f"[+] Loaded {len(urls)} URL(s) for testing.")
+    for encoded_payload in encoded_payloads:
+        try:
+            rate_limit_request()  # Enforce rate limiting before each request
+            if method == "POST":
+                async with session.post(url, cookies=cookies, headers=headers, data={'payload': encoded_payload}) as response:
+                    response.raise_for_status()
+                    text = await response.text()
+                    if encoded_payload in text:
+                        logging.info(f"Payload: {encoded_payload}, Response URL: {url}")
+                        print(f"\033[1;32m[WAF BYPASS - XSS DETECTED]\033[0m Payload: {encoded_payload}, Response URL: {url}")
+                        return {'type': 'WAF Bypass XSS', 'url': url, 'payload': encoded_payload}
+            else:
+                async with session.get(url, cookies=cookies, headers=headers, params={'payload': encoded_payload}) as response:
+                    response.raise_for_status()
+                    text = await response.text()
+                    if encoded_payload in text:
+                        logging.info(f"Payload: {encoded_payload}, Response URL: {url}")
+                        print(f"\033[1;32m[WAF BYPASS - XSS DETECTED]\033[0m Payload: {encoded_payload}, Response URL: {url}")
+                        return {'type': 'WAF Bypass XSS', 'url': url, 'payload': encoded_payload}
+        except RequestException as e:
+            print(f"\033[1;31m[ERROR]\033[0m Error with {url} during WAF bypass: {e}")
+        except Exception as e:
+            print(f"\033[1;31m[ERROR]\033[0m Unexpected error: {e}")
 
-    # Use ThreadPoolExecutor to run scans in parallel (further reduced workers)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
-        executor.map(scan_url, urls)
-
+# Main execution block
 if __name__ == "__main__":
-    main()
+    check_for_updates()
